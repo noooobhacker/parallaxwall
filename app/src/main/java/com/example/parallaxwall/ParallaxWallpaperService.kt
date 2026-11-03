@@ -24,9 +24,14 @@ class ParallaxWallpaperService : WallpaperService() {
             if (v != loadedVersion) {
                 loadedVersion = v
                 val file = File(filesDir, Prefs.WALLPAPER_FILE)
+                val bg = File(filesDir, Prefs.WALLPAPER_BG)
+                val fg = File(filesDir, Prefs.WALLPAPER_FG)
+                val layered = bg.exists() && fg.exists()
                 renderer.setMedia(
                     if (file.exists()) file else null,
-                    p.getBoolean(Prefs.KEY_IS_VIDEO, false)
+                    p.getBoolean(Prefs.KEY_IS_VIDEO, false),
+                    if (layered) bg else null,
+                    if (layered) fg else null
                 )
             }
             renderer.requestDraw()

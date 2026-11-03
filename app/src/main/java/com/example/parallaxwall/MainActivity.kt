@@ -215,17 +215,35 @@ class MainActivity : ComponentActivity() {
         setBusy(true, "Loading…")
         Thread {
             try {
-                MediaUtil.copyUriToFile(this, uri, File(filesDir, Prefs.CURRENT_FILE))
+                val cur = File(filesDir, Prefs.CURRENT_FILE)
+                val bgF = File(filesDir, Prefs.CURRENT_BG)
+                val fgF = File(filesDir, Prefs.CURRENT_FG)
+                bgF.delete()
+                fgF.delete()
+                MediaUtil.copyUriToFile(this, uri, cur)
                 getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE).edit()
                     .putBoolean(Prefs.KEY_CURRENT_VIDEO, isVideo).commit()
+                var separated = true
+                if (!isVideo) {
+                    separated = SubjectCutout.createLayers(this, cur, bgF, fgF) { msg ->
+                        runOnUiThread { status.text = msg }
+                    }
+                    if (!separated) {
+                        bgF.delete()
+                        fgF.delete()
+                    }
+                }
                 runOnUiThread {
                     setBusy(false)
                     renderer.userZoom = 1f
                     renderer.panX = 0f
                     renderer.panY = 0f
                     showCurrent(isVideo)
+                    if (!isVideo && !separated) {
+                        toast("Could not separate the object (needs Google Play services and internet once). Using the whole picture.")
+                    }
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "pick failed", e)
                 runOnUiThread {
                     setBusy(false)
@@ -249,7 +267,10 @@ class MainActivity : ComponentActivity() {
         hasMedia = true
         currentIsVideo = isVideo
         hint.visibility = View.GONE
-        renderer.setMedia(file, isVideo)
+        val bgF = File(filesDir, Prefs.CURRENT_BG)
+        val fgF = File(filesDir, Prefs.CURRENT_FG)
+        val layered = !isVideo && bgF.exists() && fgF.exists()
+        renderer.setMedia(file, isVideo, if (layered) bgF else null, if (layered) fgF else null)
     }
 
     // ---------------- set wallpaper ----------------
@@ -270,6 +291,16 @@ class MainActivity : ComponentActivity() {
                 val src = File(filesDir, Prefs.CURRENT_FILE)
                 val dst = File(filesDir, Prefs.WALLPAPER_FILE)
                 src.copyTo(dst, overwrite = true)
+                val wbg = File(filesDir, Prefs.WALLPAPER_BG)
+                val wfg = File(filesDir, Prefs.WALLPAPER_FG)
+                wbg.delete()
+                wfg.delete()
+                val cbg = File(filesDir, Prefs.CURRENT_BG)
+                val cfg = File(filesDir, Prefs.CURRENT_FG)
+                if (!isVideo && cbg.exists() && cfg.exists()) {
+                    cbg.copyTo(wbg, overwrite = true)
+                    cfg.copyTo(wfg, overwrite = true)
+                }
                 getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE).edit()
                     .putBoolean(Prefs.KEY_IS_VIDEO, isVideo)
                     .putInt(Prefs.KEY_SENS, sens)
@@ -346,12 +377,18 @@ class MainActivity : ComponentActivity() {
         val py = renderer.panY
         val (w, h) = outputSize()
         val src = File(filesDir, Prefs.CURRENT_FILE)
+        val cbg = File(filesDir, Prefs.CURRENT_BG)
+        val cfg = File(filesDir, Prefs.CURRENT_FG)
+        val layered = !isVideo && cbg.exists() && cfg.exists()
         setBusy(true, "Rendering loop video… 0%")
         Thread {
             val tmp = File(cacheDir, "loop_tmp.mp4")
             try {
                 if (tmp.exists()) tmp.delete()
-                LoopExporter().export(src.absolutePath, isVideo, sens, zoom, px, py, w, h, tmp) { pct ->
+                LoopExporter().export(
+                    src.absolutePath, isVideo, sens, zoom, px, py, w, h, tmp,
+                    if (layered) cbg else null, if (layered) cfg else null
+                ) { pct ->
                     runOnUiThread { status.text = "Rendering loop video… $pct%" }
                 }
                 runOnUiThread { status.text = "Saving to gallery…" }

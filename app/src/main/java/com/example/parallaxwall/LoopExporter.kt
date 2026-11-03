@@ -1,5 +1,6 @@
 package com.example.parallaxwall
 
+import android.graphics.BitmapFactory
 import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -43,6 +44,8 @@ class LoopExporter {
         outW: Int,
         outH: Int,
         outFile: File,
+        bgLayer: File?,
+        fgLayer: File?,
         onProgress: (Int) -> Unit
     ) {
         var egl: EglCore? = null
@@ -68,7 +71,7 @@ class LoopExporter {
             if (isVideo) {
                 renderVideo(core, srcPath, sensitivity, zoom, panX, panY, outW, outH, onProgress)
             } else {
-                renderImage(core, srcPath, sensitivity, zoom, panX, panY, outW, outH, onProgress)
+                renderImage(core, srcPath, sensitivity, zoom, panX, panY, outW, outH, bgLayer, fgLayer, onProgress)
             }
             drain(true)
         } finally {
@@ -103,13 +106,30 @@ class LoopExporter {
 
     private fun renderImage(
         egl: EglCore, srcPath: String, sens: Int, zoom: Float, panX: Float, panY: Float,
-        outW: Int, outH: Int, onProgress: (Int) -> Unit
+        outW: Int, outH: Int, bgLayer: File?, fgLayer: File?, onProgress: (Int) -> Unit
     ) {
-        val bmp = MediaUtil.loadBitmap(srcPath, 2560) ?: throw IOException("Cannot read the photo")
-        val cw = bmp.width
-        val ch = bmp.height
-        val scene = SceneDrawer.image(bmp)
-        bmp.recycle()
+        var cw = 0
+        var ch = 0
+        var sceneOrNull: SceneDrawer? = null
+        if (bgLayer != null && fgLayer != null && bgLayer.exists() && fgLayer.exists()) {
+            val bgBmp = BitmapFactory.decodeFile(bgLayer.absolutePath)
+            val cutBmp = BitmapFactory.decodeFile(fgLayer.absolutePath)
+            if (bgBmp != null && cutBmp != null) {
+                cw = bgBmp.width
+                ch = bgBmp.height
+                sceneOrNull = SceneDrawer.layered(bgBmp, cutBmp)
+            }
+            bgBmp?.recycle()
+            cutBmp?.recycle()
+        }
+        if (sceneOrNull == null) {
+            val bmp = MediaUtil.loadBitmap(srcPath, 2560) ?: throw IOException("Cannot read the photo")
+            cw = bmp.width
+            ch = bmp.height
+            sceneOrNull = SceneDrawer.image(bmp)
+            bmp.recycle()
+        }
+        val scene: SceneDrawer = sceneOrNull
         try {
             val f = Cover.MAX_SHIFT * sens / 100f
             val total = FPS * IMAGE_SECONDS

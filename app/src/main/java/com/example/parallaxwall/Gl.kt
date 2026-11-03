@@ -299,8 +299,11 @@ class QuadProgram(private val external: Boolean, blur: Boolean) {
 }
 
 /**
- * Draws one frame: a blurred, edge-extended background (fills whatever the picture does not cover)
- * plus the sharp picture fitted exactly to the screen.
+ * Draws one frame.
+ *  - plain mode: blurred, edge-extended background + the picture fitted exactly to the screen
+ *    (the whole picture moves with the tilt)
+ *  - layered mode (photos with a separated object): the background stays STILL and only the
+ *    cut-out object moves with the tilt
  */
 class SceneDrawer private constructor(video: Boolean) {
     private val fg = QuadProgram(video, false)
@@ -308,6 +311,8 @@ class SceneDrawer private constructor(video: Boolean) {
     var fgTex = 0
         private set
     private var bgTex = 0
+    private var cutTex = 0
+    private var layered = false
     private val mvp = FloatArray(16)
 
     fun draw(
@@ -320,14 +325,28 @@ class SceneDrawer private constructor(video: Boolean) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
-        Cover.coverMvp(
-            mvp, viewW, viewH, cw, ch, Cover.BG_ZOOM,
-            shiftX * Cover.BG_SHIFT, shiftY * Cover.BG_SHIFT
-        )
-        bg.draw(bgTex, mvp, st)
-
-        Cover.fitMvp(mvp, viewW, viewH, cw, ch, zoom, panX + shiftX, panY + shiftY)
-        fg.draw(fgTex, mvp, st)
+        if (layered) {
+            // 1. blurred fill for any area the picture does not cover (static)
+            Cover.coverMvp(mvp, viewW, viewH, cw, ch, Cover.BG_ZOOM, 0f, 0f)
+            bg.draw(bgTex, mvp, st)
+            // 2. the background picture with the object removed (static)
+            Cover.fitMvp(mvp, viewW, viewH, cw, ch, zoom, panX, panY)
+            fg.draw(fgTex, mvp, st)
+            // 3. the object itself, the only thing that moves
+            GLES20.glEnable(GLES20.GL_BLEND)
+            GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+            Cover.fitMvp(mvp, viewW, viewH, cw, ch, zoom, panX + shiftX, panY + shiftY)
+            fg.draw(cutTex, mvp, st)
+            GLES20.glDisable(GLES20.GL_BLEND)
+        } else {
+            Cover.coverMvp(
+                mvp, viewW, viewH, cw, ch, Cover.BG_ZOOM,
+                shiftX * Cover.BG_SHIFT, shiftY * Cover.BG_SHIFT
+            )
+            bg.draw(bgTex, mvp, st)
+            Cover.fitMvp(mvp, viewW, viewH, cw, ch, zoom, panX + shiftX, panY + shiftY)
+            fg.draw(fgTex, mvp, st)
+        }
     }
 
     fun release() {
@@ -335,16 +354,14 @@ class SceneDrawer private constructor(video: Boolean) {
         bg.release()
         GlUtil.deleteTexture(fgTex)
         if (bgTex != fgTex) GlUtil.deleteTexture(bgTex)
+        GlUtil.deleteTexture(cutTex)
         fgTex = 0
         bgTex = 0
+        cutTex = 0
     }
 
     companion object {
-        fun image(bmp: Bitmap): SceneDrawer {
-            val d = SceneDrawer(false)
-            d.fgTex = GlUtil.createTexture(false)
-            GlUtil.uploadBitmap(d.fgTex, bmp)
-            d.bgTex = GlUtil.createTexture(false)
+        private fun uploadSmall(tex: Int, bmp: Bitmap) {
             val big = max(bmp.width, bmp.height)
             if (big > 256) {
                 val s = 256f / big
@@ -354,11 +371,32 @@ class SceneDrawer private constructor(video: Boolean) {
                     max(1, (bmp.height * s).roundToInt()),
                     true
                 )
-                GlUtil.uploadBitmap(d.bgTex, small)
+                GlUtil.uploadBitmap(tex, small)
                 if (small !== bmp) small.recycle()
             } else {
-                GlUtil.uploadBitmap(d.bgTex, bmp)
+                GlUtil.uploadBitmap(tex, bmp)
             }
+        }
+
+        fun image(bmp: Bitmap): SceneDrawer {
+            val d = SceneDrawer(false)
+            d.fgTex = GlUtil.createTexture(false)
+            GlUtil.uploadBitmap(d.fgTex, bmp)
+            d.bgTex = GlUtil.createTexture(false)
+            uploadSmall(d.bgTex, bmp)
+            return d
+        }
+
+        /** background = photo with the object removed, cut = the object (transparent elsewhere). */
+        fun layered(background: Bitmap, cut: Bitmap): SceneDrawer {
+            val d = SceneDrawer(false)
+            d.layered = true
+            d.fgTex = GlUtil.createTexture(false)
+            GlUtil.uploadBitmap(d.fgTex, background)
+            d.bgTex = GlUtil.createTexture(false)
+            uploadSmall(d.bgTex, background)
+            d.cutTex = GlUtil.createTexture(false)
+            GlUtil.uploadBitmap(d.cutTex, cut)
             return d
         }
 

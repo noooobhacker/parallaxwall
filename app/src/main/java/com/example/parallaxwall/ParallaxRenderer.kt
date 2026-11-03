@@ -1,6 +1,7 @@
 package com.example.parallaxwall
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.graphics.SurfaceTexture
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -42,6 +43,8 @@ class ParallaxRenderer(context: Context) {
 
     private var mediaFile: File? = null
     private var mediaIsVideo = false
+    private var layerBg: File? = null
+    private var layerFg: File? = null
     private var scene: SceneDrawer? = null
     private var contentW = 0
     private var contentH = 0
@@ -87,10 +90,12 @@ class ParallaxRenderer(context: Context) {
         }
     }
 
-    fun setMedia(file: File?, isVideo: Boolean) {
+    fun setMedia(file: File?, isVideo: Boolean, bgLayer: File? = null, fgLayer: File? = null) {
         handler.post {
             mediaFile = file
             mediaIsVideo = isVideo
+            layerBg = bgLayer
+            layerFg = fgLayer
             if (egl != null) {
                 loadMedia()
                 startIfActive()
@@ -165,6 +170,22 @@ class ParallaxRenderer(context: Context) {
     }
 
     private fun setupImage(file: File) {
+        val lb = layerBg
+        val lf = layerFg
+        if (lb != null && lf != null && lb.exists() && lf.exists()) {
+            val bgBmp = BitmapFactory.decodeFile(lb.absolutePath)
+            val cutBmp = BitmapFactory.decodeFile(lf.absolutePath)
+            if (bgBmp != null && cutBmp != null) {
+                contentW = bgBmp.width
+                contentH = bgBmp.height
+                scene = SceneDrawer.layered(bgBmp, cutBmp)
+                bgBmp.recycle()
+                cutBmp.recycle()
+                return
+            }
+            bgBmp?.recycle()
+            cutBmp?.recycle()
+        }
         val bmp = MediaUtil.loadBitmap(file.absolutePath, 2560) ?: return
         contentW = bmp.width
         contentH = bmp.height
