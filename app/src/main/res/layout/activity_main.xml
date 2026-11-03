@@ -31,6 +31,7 @@
                 android:layout_height="match_parent"
                 android:visibility="gone"
                 app:resize_mode="zoom"
+                app:surface_type="texture_view"
                 app:use_controller="false" />
         </FrameLayout>
 
@@ -49,6 +50,15 @@
         android:layout_height="wrap_content"
         android:orientation="vertical"
         android:padding="16dp">
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:padding="4dp"
+            android:textColor="#FFCC00"
+            android:visibility="gone" />
 
         <TextView
             android:id="@+id/sensLabel"
@@ -80,7 +90,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="Set wallpaper" />
+                android:text="Set as wallpaper" />
 
             <Button
                 android:id="@+id/saveBtn"

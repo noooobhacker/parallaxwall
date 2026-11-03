@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.parallaxwall"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
     }
 
     compileOptions {
@@ -29,4 +29,5 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.9.0")
     implementation("androidx.media3:media3-exoplayer:1.3.1")
     implementation("androidx.media3:media3-ui:1.3.1")
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
 }
