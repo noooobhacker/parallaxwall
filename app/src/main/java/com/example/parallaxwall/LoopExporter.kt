@@ -7,7 +7,6 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
-import android.opengl.GLES20
 import android.opengl.Matrix
 import android.os.Handler
 import android.os.HandlerThread
@@ -21,7 +20,8 @@ import kotlin.math.min
 import kotlin.math.sin
 
 /**
- * Renders a seamless, silent MP4 loop with an automatic parallax sway.
+ * Renders a seamless, silent MP4 loop with an automatic parallax sway, using the SAME scene
+ * (fit-to-screen + blurred fill + your zoom/position) as the preview and the wallpaper.
  * Photo -> 8 second loop. Video -> the video itself (first 15 seconds) with the sway on top.
  */
 class LoopExporter {
@@ -37,6 +37,9 @@ class LoopExporter {
         srcPath: String,
         isVideo: Boolean,
         sensitivity: Int,
+        zoom: Float,
+        panX: Float,
+        panY: Float,
         outW: Int,
         outH: Int,
         outFile: File,
@@ -63,9 +66,9 @@ class LoopExporter {
             egl = core
 
             if (isVideo) {
-                renderVideo(core, srcPath, sensitivity, outW, outH, onProgress)
+                renderVideo(core, srcPath, sensitivity, zoom, panX, panY, outW, outH, onProgress)
             } else {
-                renderImage(core, srcPath, sensitivity, outW, outH, onProgress)
+                renderImage(core, srcPath, sensitivity, zoom, panX, panY, outW, outH, onProgress)
             }
             drain(true)
         } finally {
@@ -99,37 +102,29 @@ class LoopExporter {
     // ---------------- photo ----------------
 
     private fun renderImage(
-        egl: EglCore, srcPath: String, sens: Int, outW: Int, outH: Int, onProgress: (Int) -> Unit
+        egl: EglCore, srcPath: String, sens: Int, zoom: Float, panX: Float, panY: Float,
+        outW: Int, outH: Int, onProgress: (Int) -> Unit
     ) {
         val bmp = MediaUtil.loadBitmap(srcPath, 2560) ?: throw IOException("Cannot read the photo")
         val cw = bmp.width
         val ch = bmp.height
-        val program = QuadProgram(false)
-        val tex = GlUtil.createTexture(false)
+        val scene = SceneDrawer.image(bmp)
+        bmp.recycle()
         try {
-            GlUtil.uploadBitmap(tex, bmp)
-            bmp.recycle()
-
             val f = Cover.MAX_SHIFT * sens / 100f
             val total = FPS * IMAGE_SECONDS
-            val mvp = FloatArray(16)
             for (i in 0 until total) {
                 val phase = 2.0 * PI * i / total
                 val nx = sin(phase).toFloat()
                 val ny = (0.5 * sin(2.0 * phase)).toFloat()
-                Cover.mvp(mvp, outW, outH, cw, ch, nx * f * 2f, ny * f * 2f)
-                GLES20.glViewport(0, 0, outW, outH)
-                GLES20.glClearColor(0f, 0f, 0f, 1f)
-                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                program.draw(tex, mvp, identity)
+                scene.draw(outW, outH, cw, ch, nx * f * 2f, ny * f * 2f, zoom, panX, panY, identity)
                 egl.setPresentationTime(i * 1_000_000_000L / FPS)
                 egl.swap()
                 drain(false)
                 onProgress((i + 1) * 100 / total)
             }
         } finally {
-            program.release()
-            GlUtil.deleteTexture(tex)
+            scene.release()
         }
     }
 
@@ -155,7 +150,8 @@ class LoopExporter {
     }
 
     private fun renderVideo(
-        egl: EglCore, srcPath: String, sens: Int, outW: Int, outH: Int, onProgress: (Int) -> Unit
+        egl: EglCore, srcPath: String, sens: Int, zoom: Float, panX: Float, panY: Float,
+        outW: Int, outH: Int, onProgress: (Int) -> Unit
     ) {
         val (cw, ch, durationUs) = probeVideo(srcPath)
         val capUs = MAX_VIDEO_SECONDS * 1_000_000L
@@ -163,8 +159,7 @@ class LoopExporter {
 
         val extractor = MediaExtractor()
         var decoder: MediaCodec? = null
-        var program: QuadProgram? = null
-        var tex = 0
+        var scene: SceneDrawer? = null
         var st: SurfaceTexture? = null
         var decSurface: Surface? = null
         val cbThread = HandlerThread("frame-callback").also { it.start() }
@@ -184,9 +179,9 @@ class LoopExporter {
             if (trackIdx < 0 || inFormat == null) throw IOException("No video track found")
             extractor.selectTrack(trackIdx)
 
-            program = QuadProgram(true)
-            tex = GlUtil.createTexture(true)
-            val texture = SurfaceTexture(tex)
+            val sd = SceneDrawer.video()
+            scene = sd
+            val texture = SurfaceTexture(sd.fgTex)
             st = texture
             val frameSignal = Semaphore(0)
             texture.setOnFrameAvailableListener(
@@ -202,7 +197,6 @@ class LoopExporter {
             dec.start()
 
             val f = Cover.MAX_SHIFT * sens / 100f
-            val mvp = FloatArray(16)
             val stMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
             val baseUs = extractor.sampleTime.coerceAtLeast(0L)
             val decInfo = MediaCodec.BufferInfo()
@@ -247,11 +241,7 @@ class LoopExporter {
                         val phase = 2.0 * PI * relUs.toDouble() / loopUs.toDouble()
                         val nx = sin(phase).toFloat()
                         val ny = (0.5 * sin(2.0 * phase)).toFloat()
-                        Cover.mvp(mvp, outW, outH, cw, ch, nx * f * 2f, ny * f * 2f)
-                        GLES20.glViewport(0, 0, outW, outH)
-                        GLES20.glClearColor(0f, 0f, 0f, 1f)
-                        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                        program.draw(tex, mvp, stMatrix)
+                        sd.draw(outW, outH, cw, ch, nx * f * 2f, ny * f * 2f, zoom, panX, panY, stMatrix)
                         egl.setPresentationTime(relUs * 1000L)
                         egl.swap()
                         drain(false)
@@ -284,10 +274,9 @@ class LoopExporter {
             } catch (e: Exception) {
             }
             try {
-                program?.release()
+                scene?.release()
             } catch (e: Exception) {
             }
-            GlUtil.deleteTexture(tex)
             try {
                 extractor.release()
             } catch (e: Exception) {

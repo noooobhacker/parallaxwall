@@ -6,39 +6,36 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
+import android.graphics.BitmapFactory
+import android.graphics.SurfaceTexture
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.PlayerView
 import java.io.File
 import kotlin.math.max
 import kotlin.math.min
 
-class MainActivity : ComponentActivity(), SensorEventListener {
+class MainActivity : ComponentActivity() {
 
-    private lateinit var sensorManager: SensorManager
-    private lateinit var content: FrameLayout
-    private lateinit var imageView: ImageView
-    private lateinit var playerView: PlayerView
+    private lateinit var renderer: ParallaxRenderer
+    private lateinit var stage: FrameLayout
+    private lateinit var preview: TextureView
     private lateinit var hint: TextView
     private lateinit var sensLabel: TextView
     private lateinit var status: TextView
@@ -46,13 +43,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var pickBtn: Button
     private lateinit var setBtn: Button
     private lateinit var saveBtn: Button
+    private lateinit var resetBtn: Button
+    private lateinit var scaleDetector: ScaleGestureDetector
 
-    private var player: ExoPlayer? = null
     private var sensitivity = 50
     private var hasMedia = false
     private var currentIsVideo = false
     private var busy = false
-    private val tilt = TiltTracker()
+    private var lastX = 0f
+    private var lastY = 0f
 
     private val picker =
         registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
@@ -68,10 +67,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
-        content = findViewById(R.id.content)
-        imageView = findViewById(R.id.imageView)
-        playerView = findViewById(R.id.playerView)
+        stage = findViewById(R.id.stage)
+        preview = findViewById(R.id.preview)
         hint = findViewById(R.id.hint)
         sensLabel = findViewById(R.id.sensLabel)
         status = findViewById(R.id.status)
@@ -79,11 +76,80 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         pickBtn = findViewById(R.id.pickBtn)
         setBtn = findViewById(R.id.setBtn)
         saveBtn = findViewById(R.id.saveBtn)
+        resetBtn = findViewById(R.id.resetBtn)
+
+        renderer = ParallaxRenderer(this)
 
         val prefs = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
         sensitivity = prefs.getInt(Prefs.KEY_SENS, 50)
+        renderer.sensitivity = sensitivity
         seek.progress = sensitivity
         sensLabel.text = "Sensitivity: $sensitivity"
+
+        preview.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                renderer.setSurface(Surface(st), w, h, true)
+            }
+
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
+                renderer.setSurface(Surface(st), w, h, true)
+            }
+
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                renderer.surfaceDestroyed()
+                return true
+            }
+
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+        }
+
+        // The preview has the same shape as the phone screen, so what you see is what you get.
+        stage.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fitPreview() }
+
+        scaleDetector = ScaleGestureDetector(
+            this,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(d: ScaleGestureDetector): Boolean {
+                    renderer.userZoom =
+                        (renderer.userZoom * d.scaleFactor).coerceIn(Cover.MIN_ZOOM, Cover.MAX_ZOOM)
+                    renderer.requestDraw()
+                    return true
+                }
+            }
+        )
+
+        preview.setOnTouchListener { v, ev ->
+            scaleDetector.onTouchEvent(ev)
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    lastX = ev.x
+                    lastY = ev.y
+                }
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    lastX = ev.getX(ev.actionIndex)
+                    lastY = ev.getY(ev.actionIndex)
+                }
+                MotionEvent.ACTION_POINTER_UP -> {
+                    val keep = if (ev.actionIndex == 0) 1 else 0
+                    if (keep < ev.pointerCount) {
+                        lastX = ev.getX(keep)
+                        lastY = ev.getY(keep)
+                    }
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (!scaleDetector.isInProgress && ev.pointerCount == 1 && v.width > 0 && v.height > 0) {
+                        val dx = ev.x - lastX
+                        val dy = ev.y - lastY
+                        renderer.panX = (renderer.panX + 2f * dx / v.width).coerceIn(-2f, 2f)
+                        renderer.panY = (renderer.panY - 2f * dy / v.height).coerceIn(-2f, 2f)
+                        renderer.requestDraw()
+                    }
+                    lastX = ev.x
+                    lastY = ev.y
+                }
+            }
+            true
+        }
 
         pickBtn.setOnClickListener {
             picker.launch(
@@ -95,21 +161,51 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
                 sensitivity = p
                 sensLabel.text = "Sensitivity: $p"
-                applyTransform()
+                renderer.sensitivity = p
+                renderer.requestDraw()
             }
 
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
 
+        resetBtn.setOnClickListener {
+            renderer.userZoom = 1f
+            renderer.panX = 0f
+            renderer.panY = 0f
+            renderer.requestDraw()
+        }
         setBtn.setOnClickListener { onSetWallpaper() }
         saveBtn.setOnClickListener { onSaveLoop() }
 
         // restore the last picked media (e.g. after the activity was recreated)
         val last = File(filesDir, Prefs.CURRENT_FILE)
         if (last.exists()) showCurrent(prefs.getBoolean(Prefs.KEY_CURRENT_VIDEO, false))
+    }
 
-        applyTransform()
+    private fun fitPreview() {
+        val aw = stage.width
+        val ah = stage.height
+        if (aw <= 0 || ah <= 0) return
+        val dm = resources.displayMetrics
+        val sw = min(dm.widthPixels, dm.heightPixels).toFloat()
+        val sh = max(dm.widthPixels, dm.heightPixels).toFloat()
+        val aspect = sw / sh
+        var w = aw.toFloat()
+        var h = w / aspect
+        if (h > ah) {
+            h = ah.toFloat()
+            w = h * aspect
+        }
+        val nw = w.toInt()
+        val nh = h.toInt()
+        val lp = preview.layoutParams as FrameLayout.LayoutParams
+        if (lp.width != nw || lp.height != nh) {
+            lp.width = nw
+            lp.height = nh
+            lp.gravity = Gravity.CENTER
+            preview.layoutParams = lp
+        }
     }
 
     // ---------------- picking ----------------
@@ -124,6 +220,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     .putBoolean(Prefs.KEY_CURRENT_VIDEO, isVideo).commit()
                 runOnUiThread {
                     setBusy(false)
+                    renderer.userZoom = 1f
+                    renderer.panX = 0f
+                    renderer.panY = 0f
                     showCurrent(isVideo)
                 }
             } catch (e: Exception) {
@@ -138,34 +237,19 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun showCurrent(isVideo: Boolean) {
         val file = File(filesDir, Prefs.CURRENT_FILE)
-        releasePlayer()
-        tilt.reset()
-        if (isVideo) {
-            imageView.visibility = View.GONE
-            playerView.visibility = View.VISIBLE
-            val p = ExoPlayer.Builder(this).build()
-            p.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
-            p.repeatMode = Player.REPEAT_MODE_ONE
-            p.volume = 0f
-            p.prepare()
-            p.playWhenReady = true
-            playerView.player = p
-            player = p
-        } else {
-            playerView.visibility = View.GONE
-            val bmp = MediaUtil.loadBitmap(file.absolutePath, 2048)
-            if (bmp == null) {
+        if (!isVideo) {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
                 hasMedia = false
                 toast("Could not read that photo")
                 return
             }
-            imageView.setImageBitmap(bmp)
-            imageView.visibility = View.VISIBLE
         }
         hasMedia = true
         currentIsVideo = isVideo
         hint.visibility = View.GONE
-        applyTransform()
+        renderer.setMedia(file, isVideo)
     }
 
     // ---------------- set wallpaper ----------------
@@ -177,6 +261,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
         val isVideo = currentIsVideo
         val sens = sensitivity
+        val zoom = renderer.userZoom
+        val px = renderer.panX
+        val py = renderer.panY
         setBusy(true, "Preparing wallpaper…")
         Thread {
             try {
@@ -186,6 +273,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE).edit()
                     .putBoolean(Prefs.KEY_IS_VIDEO, isVideo)
                     .putInt(Prefs.KEY_SENS, sens)
+                    .putFloat(Prefs.KEY_ZOOM, zoom)
+                    .putFloat(Prefs.KEY_PANX, px)
+                    .putFloat(Prefs.KEY_PANY, py)
                     .putLong(Prefs.KEY_VERSION, System.currentTimeMillis())
                     .commit()
                 runOnUiThread {
@@ -251,6 +341,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         if (busy || !hasMedia) return
         val isVideo = currentIsVideo
         val sens = sensitivity
+        val zoom = renderer.userZoom
+        val px = renderer.panX
+        val py = renderer.panY
         val (w, h) = outputSize()
         val src = File(filesDir, Prefs.CURRENT_FILE)
         setBusy(true, "Rendering loop video… 0%")
@@ -258,7 +351,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val tmp = File(cacheDir, "loop_tmp.mp4")
             try {
                 if (tmp.exists()) tmp.delete()
-                LoopExporter().export(src.absolutePath, isVideo, sens, w, h, tmp) { pct ->
+                LoopExporter().export(src.absolutePath, isVideo, sens, zoom, px, py, w, h, tmp) { pct ->
                     runOnUiThread { status.text = "Rendering loop video… $pct%" }
                 }
                 runOnUiThread { status.text = "Saving to gallery…" }
@@ -279,52 +372,21 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }.start()
     }
 
-    // ---------------- preview transform / sensors ----------------
-
-    private fun applyTransform() {
-        val f = Cover.MAX_SHIFT * sensitivity / 100f
-        // the zoom is FIXED: the slider only changes how far the picture moves
-        content.scaleX = Cover.ZOOM
-        content.scaleY = Cover.ZOOM
-        content.translationX = tilt.x * content.width * f
-        content.translationY = tilt.y * content.height * f
-    }
-
-    override fun onSensorChanged(e: SensorEvent) {
-        tilt.update(e.values)
-        applyTransform()
-    }
-
-    override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+    // ---------------- lifecycle ----------------
 
     override fun onResume() {
         super.onResume()
-        val s = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
-            ?: sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-        if (s != null) {
-            tilt.reset()
-            sensorManager.registerListener(this, s, SensorManager.SENSOR_DELAY_GAME)
-        } else {
-            toast("No motion sensor found")
-        }
-        player?.play()
+        renderer.setActive(true)
     }
 
     override fun onPause() {
         super.onPause()
-        sensorManager.unregisterListener(this)
-        player?.pause()
+        renderer.setActive(false)
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        releasePlayer()
-    }
-
-    private fun releasePlayer() {
-        player?.release()
-        player = null
-        playerView.player = null
+        renderer.destroy()
     }
 
     private fun setBusy(b: Boolean, msg: String = "") {

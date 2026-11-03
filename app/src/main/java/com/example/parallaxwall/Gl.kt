@@ -15,22 +15,49 @@ import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import kotlin.math.max
+import kotlin.math.roundToInt
 
-/** Shared geometry: the picture is always drawn with the SAME fixed zoom, only the shift changes. */
+/** Layout maths shared by the preview, the live wallpaper and the loop-video exporter. */
 object Cover {
-    const val ZOOM = 1.22f        // fixed zoom (gives room for the movement, never changes)
-    const val MAX_SHIFT = 0.10f   // shift at sensitivity 100, as a fraction of the view size
+    const val MAX_SHIFT = 0.10f   // foreground shift at sensitivity 100 (fraction of the screen)
+    const val BG_ZOOM = 1.15f     // background is slightly larger so tilting never shows black edges
+    const val BG_SHIFT = 0.5f     // background moves less than the foreground = depth
+    const val MIN_ZOOM = 0.5f
+    const val MAX_ZOOM = 3.0f
 
-    /** tx, ty are offsets in normalized device coordinates (full screen width = 2). */
-    fun mvp(out: FloatArray, viewW: Int, viewH: Int, contentW: Int, contentH: Int, tx: Float, ty: Float) {
+    private fun aspects(viewW: Int, viewH: Int, cw: Int, ch: Int): Pair<Float, Float> {
         val va = viewW.toFloat() / viewH.toFloat()
-        val ca = if (contentW > 0 && contentH > 0) contentW.toFloat() / contentH.toFloat() else va
+        val ca = if (cw > 0 && ch > 0) cw.toFloat() / ch.toFloat() else va
+        return Pair(va, ca)
+    }
+
+    /** Whole picture visible, exactly fitted to the screen (no crop, no zoom at zoom = 1). */
+    fun fitMvp(
+        out: FloatArray, viewW: Int, viewH: Int, cw: Int, ch: Int,
+        zoom: Float, tx: Float, ty: Float
+    ) {
+        val (va, ca) = aspects(viewW, viewH, cw, ch)
+        var sx = 1f
+        var sy = 1f
+        if (ca > va) sy = va / ca else sx = ca / va
+        Matrix.setIdentityM(out, 0)
+        Matrix.translateM(out, 0, tx, ty, 0f)
+        Matrix.scaleM(out, 0, sx * zoom, sy * zoom, 1f)
+    }
+
+    /** Picture covers the whole screen (used for the blurred background). */
+    fun coverMvp(
+        out: FloatArray, viewW: Int, viewH: Int, cw: Int, ch: Int,
+        zoom: Float, tx: Float, ty: Float
+    ) {
+        val (va, ca) = aspects(viewW, viewH, cw, ch)
         var sx = 1f
         var sy = 1f
         if (ca > va) sx = ca / va else sy = va / ca
         Matrix.setIdentityM(out, 0)
         Matrix.translateM(out, 0, tx, ty, 0f)
-        Matrix.scaleM(out, 0, sx * ZOOM, sy * ZOOM, 1f)
+        Matrix.scaleM(out, 0, sx * zoom, sy * zoom, 1f)
     }
 }
 
@@ -122,7 +149,7 @@ class EglCore(surface: Surface, recordable: Boolean) {
             if (eglSurface != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(display, eglSurface)
             if (context != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(display, context)
             EGL14.eglReleaseThread()
-            // NOTE: eglTerminate is intentionally NOT called: the display is shared by the whole process.
+            // eglTerminate is intentionally NOT called: the display is shared by the whole process.
         }
         eglSurface = EGL14.EGL_NO_SURFACE
         context = EGL14.EGL_NO_CONTEXT
@@ -134,7 +161,7 @@ class EglCore(surface: Surface, recordable: Boolean) {
     }
 }
 
-class QuadProgram(private val external: Boolean) {
+class QuadProgram(private val external: Boolean, blur: Boolean) {
     private val program: Int
     private val aPos: Int
     private val aTex: Int
@@ -155,26 +182,38 @@ class QuadProgram(private val external: Boolean) {
                 vTex = (uSt * vec4(aTex, 0.0, 1.0)).xy;
             }
         """.trimIndent()
-        val fs = if (external) {
+
+        val header = if (external) {
+            "#extension GL_OES_EGL_image_external : require\nprecision mediump float;\n"
+        } else {
+            "precision mediump float;\n"
+        }
+        val sampler = if (external) "samplerExternalOES" else "sampler2D"
+        val body = if (blur) {
             """
-            #extension GL_OES_EGL_image_external : require
-            precision mediump float;
             varying vec2 vTex;
-            uniform samplerExternalOES uTex;
+            uniform $sampler uTex;
             void main() {
-                gl_FragColor = texture2D(uTex, vTex);
+                vec3 sum = vec3(0.0);
+                for (int i = 0; i < 24; i++) {
+                    float fi = float(i);
+                    float ang = fi * 2.399963;
+                    float rad = 0.06 * sqrt((fi + 0.5) / 24.0);
+                    sum += texture2D(uTex, vTex + vec2(cos(ang), sin(ang)) * rad).rgb;
+                }
+                gl_FragColor = vec4(sum / 24.0, 1.0);
             }
             """.trimIndent()
         } else {
             """
-            precision mediump float;
             varying vec2 vTex;
-            uniform sampler2D uTex;
+            uniform $sampler uTex;
             void main() {
                 gl_FragColor = texture2D(uTex, vTex);
             }
             """.trimIndent()
         }
+        val fs = header + body
 
         val vsId = compile(GLES20.GL_VERTEX_SHADER, vs)
         val fsId = compile(GLES20.GL_FRAGMENT_SHADER, fs)
@@ -256,5 +295,78 @@ class QuadProgram(private val external: Boolean) {
             throw RuntimeException("Shader compile failed: $log")
         }
         return s
+    }
+}
+
+/**
+ * Draws one frame: a blurred, edge-extended background (fills whatever the picture does not cover)
+ * plus the sharp picture fitted exactly to the screen.
+ */
+class SceneDrawer private constructor(video: Boolean) {
+    private val fg = QuadProgram(video, false)
+    private val bg = QuadProgram(video, true)
+    var fgTex = 0
+        private set
+    private var bgTex = 0
+    private val mvp = FloatArray(16)
+
+    fun draw(
+        viewW: Int, viewH: Int, cw: Int, ch: Int,
+        shiftX: Float, shiftY: Float,
+        zoom: Float, panX: Float, panY: Float,
+        st: FloatArray
+    ) {
+        GLES20.glViewport(0, 0, viewW, viewH)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
+        Cover.coverMvp(
+            mvp, viewW, viewH, cw, ch, Cover.BG_ZOOM,
+            shiftX * Cover.BG_SHIFT, shiftY * Cover.BG_SHIFT
+        )
+        bg.draw(bgTex, mvp, st)
+
+        Cover.fitMvp(mvp, viewW, viewH, cw, ch, zoom, panX + shiftX, panY + shiftY)
+        fg.draw(fgTex, mvp, st)
+    }
+
+    fun release() {
+        fg.release()
+        bg.release()
+        GlUtil.deleteTexture(fgTex)
+        if (bgTex != fgTex) GlUtil.deleteTexture(bgTex)
+        fgTex = 0
+        bgTex = 0
+    }
+
+    companion object {
+        fun image(bmp: Bitmap): SceneDrawer {
+            val d = SceneDrawer(false)
+            d.fgTex = GlUtil.createTexture(false)
+            GlUtil.uploadBitmap(d.fgTex, bmp)
+            d.bgTex = GlUtil.createTexture(false)
+            val big = max(bmp.width, bmp.height)
+            if (big > 256) {
+                val s = 256f / big
+                val small = Bitmap.createScaledBitmap(
+                    bmp,
+                    max(1, (bmp.width * s).roundToInt()),
+                    max(1, (bmp.height * s).roundToInt()),
+                    true
+                )
+                GlUtil.uploadBitmap(d.bgTex, small)
+                if (small !== bmp) small.recycle()
+            } else {
+                GlUtil.uploadBitmap(d.bgTex, bmp)
+            }
+            return d
+        }
+
+        fun video(): SceneDrawer {
+            val d = SceneDrawer(true)
+            d.fgTex = GlUtil.createTexture(true)
+            d.bgTex = d.fgTex
+            return d
+        }
     }
 }
